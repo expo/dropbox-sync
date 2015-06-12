@@ -6,7 +6,13 @@ var fs = require('fs');
 var moment = require('moment-timezone');
 var mkdirp = require('mkdirp');
 var path = require('path');
-var secret = require('@exponent/secret');
+var secret = {
+};
+try {
+  secret = require('@exponent/secret');
+} catch (e) {
+  console.error("You may want to install @exponent/secret or something similar");
+}
 
 function getClient() {
   return new dropbox.Client({
@@ -14,6 +20,13 @@ function getClient() {
     key: secret.dropbox.appKey,
     secret: secret.dropbox.appSecret,
   });
+}
+
+var testClient = null;
+try {
+  testClient = getClient();
+} catch (e) {
+  // Already gave an error
 }
 
 class DropboxSyncer extends events.EventEmitter {
@@ -91,6 +104,10 @@ class DropboxSyncer extends events.EventEmitter {
         this.logger.error("No response from polling; will retry");
 
         result = {hasChanges: false, retryAfter: 2000};
+      } else {
+        if (!result.hasChanges) {
+          this.emitter.emit('updatedAsOf', Date.now());
+        }
       }
 
       if (!result.hasChanges && result.retryAfter) {
@@ -103,8 +120,6 @@ class DropboxSyncer extends events.EventEmitter {
 
     return this._syncLoopAsync();
   }
-
-  _
 
   async syncAsync() {
     var delta = await this.client.promise.delta(this.cursor);
@@ -135,6 +150,7 @@ class DropboxSyncer extends events.EventEmitter {
     this.cursor = newCursor;
     this.logger.log("New cursor is now", this.cursor);
     this.emitter.emit('syncedToCursor', this.cursor);
+    this.emitter.emit('updatedAsOf', Date.now());
     return this.cursor;
 
   }
@@ -191,6 +207,7 @@ module.exports = function (...args) {
 };
 
 _.assign(module.exports, {
+  dropbox,
   DropboxSyncer,
   getClient,
   c: getClient(),

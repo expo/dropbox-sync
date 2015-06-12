@@ -1,5 +1,5 @@
 {
-  "name": "dropbox-sync",
+  "name": "@exponent/dropbox-sync",
   "version": "2.0.0",
   "description": "A daemon for syncing a Dropbox folder",
   "main": "build/index.js",
