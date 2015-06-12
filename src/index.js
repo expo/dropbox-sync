@@ -16,137 +16,182 @@ function getClient() {
   });
 }
 
-function startSyncing(client, destFolder, opts) {
-  opts = opts || {};
-  var cursor = opts.cursor || null;
-  delete opts.cursor;
-  if (opts.verbose) {
-    console.log("Created destination folder", destFolder);
+class DropboxSyncer extends events.EventEmitter {
+  constructor(client, destFolder, opts) {
+
+    super();
+    this.client = client || getClient();
+    this.destFolder = destFolder;
+    this.opts = opts = opts || {};
+    this.state = 'stopped';
+
+    this.cursor = opts.cursor || null;
+    this.emitter = opts.emitter || this;
+    this._shouldStop = false;
+    this.logger = opts.logger || console || {
+      log: () => undefined,
+      error: () => undefined,
+      warn: () => undefined,
+    };
+
   }
 
-  var emitter = new events.EventEmitter();
-  emitter._flags = {};
-  emitter.stopSyncingAsync = function () {
-    emitter._flags.stop = true;
+  startSyncing() {
+    this._shouldStop = false;
+    this.state = 'syncing';
+    this._syncLoopAsync().then((result) => {
+      if (result != null) {
+        this.logger.log(result);
+      }
+    }).catch((err) => {
+      if (this.opts.logger) {
+        this.logger.error(err, err.stack);
+      } else {
+        console.error(err, err.stack);
+      }
+    });
+    return this;
+  }
+
+  stopSyncingAsync() {
+    this._shouldStop = true;
     return new Promise((fulfill, reject) => {
-      emitter.on('stopped', fulfill);
+      this.emitter.on('stopped', fulfill);
     });
   }
 
-  syncLoop(client, cursor, destFolder, emitter, opts, emitter._flags).then(console.log, console.error);
-
-  return emitter;
-
-}
-
-async function syncLoop(client, cursor, destFolder, emitter, opts, flags) {
-
-  opts = opts || {};
-  await mkdirp.promise(destFolder);
-  if (flags.stop) {
-    emitter.emit('stopped', cursor);
-    return;
+  _stop() {
+    this.state = 'stopped';
+    this.emitter.emit('stopped', this.cursor);
+    return this.cursor;
   }
-  var newCursor = await getAsync(client, cursor, destFolder, emitter, opts);
-  if (flags.stop) {
-    emitter.emit('stopped', cursor);
-    return;
-  }
-  var result;
-  do {
-    if (opts.verbose) {
-      console.log("Polling for changes...");
-    }
-    result = await client.promise.pollForChanges(newCursor);
-    if (opts.verbose) {
-      console.log("Polled successfuly");
-    }
-    if (flags.stop) {
-      emitter.emit('stopped', cursor);
-      return;
-    }
-    if (!result) {
-      console.error("Failure! No response from `pollForChanges`");
-      // TODO: Implement a smart back-off strategy
-      result = {hasChanges: false, retryAfter: 30000};
-    }
-    if (!result.hasChanges && result.retryAfter) {
-      await delayAsync(result.retryAfter * 1000);
-      if (flags.stop) {
-        return;
+
+  async _syncLoopAsync() {
+
+    await mkdirp.promise(this.destFolder);
+
+    if (this._shouldStop) { return this._stop(); }
+
+    var newCursor = await this.syncAsync();
+
+    if (this._shouldStop) { return this._stop(); }
+
+    var result;
+    do {
+      this.logger.log("Polling for changes...");
+
+      result = await this.client.promise.pollForChanges(newCursor);
+
+      this.logger.log("Polled successfully");
+
+      if (this._shouldStop) { return this._stop(); }
+
+      if (!result) {
+        // Not sure what to do here, so we'll just back off and try again in a bit
+        this.logger.error("No response from polling; will retry");
+
+        result = {hasChanges: false, retryAfter: 2000};
       }
+
+      if (!result.hasChanges && result.retryAfter) {
+        await delayAsync(result.retryAfter * 1000);
+      }
+
+    } while (!result.hasChanges && !this._shouldStop);
+
+    if (this._shouldStop) { return this._stop(); }
+
+    return this._syncLoopAsync();
+  }
+
+  _
+
+  async syncAsync() {
+    var delta = await this.client.promise.delta(this.cursor);
+
+    if (!delta) {
+      return this.cursor;
     }
-  } while (!result.hasChanges && !flags.stop);
 
+    var newCursor = delta.cursorTag;
 
-  if (flags.stop) {
-    emitter.emit('stopped', cursor);
-    return;
+    var awaitables = [];
+    for (var change of delta.changes) {
+      this.emitter.emit('changeTo', change.path, change);
+      awaitables.push(this.processChangeAsync(change));
+    }
+
+    try {
+      await Promise.all(awaitables);
+    } catch (e) {
+      this.logger.error("Error syncing (but will keep trying):", e.message);
+      this.emitter.emit('errorIgnored', e);
+      // TODO: Implement some kind of smart backoff
+      await delayAsync(2000);
+      return this.cursor;
+    }
+
+    // Update cursor to the new value since we've successfully updated
+    this.cursor = newCursor;
+    this.logger.log("New cursor is now", this.cursor);
+    this.emitter.emit('syncedToCursor', this.cursor);
+    return this.cursor;
+
   }
-  return syncLoop(client, newCursor, destFolder, emitter, opts, flags);
 
+  async processChangeAsync(change) {
+    var dest = path.join(this.destFolder, change.path);
+    this.logger.log("Syncing to", dest, "...");
+    if (change.wasRemoved) {
+
+    } else if (change.stat.isFolder) {
+
+      if (change.wasRemoved) {
+        await fs.promise.rmdir(dest);
+        this.emitter.emit('didRemove', dest, change);
+      } else {
+        await mkdirp.promise(dest);
+        if (this.opts.logger) { this.opts.logger.log("Updating folder at", dest); }
+        this.emitter.emit('didMkdirp', dest, change);
+      }
+
+    } else if (change.stat.isFile) {
+      if (change.wasRemoved) {
+        try {
+          await fs.promise.unlink(dest);
+        } catch (e) {
+          if (e.message && e.message.match(/ENOENT:/)) {
+            this.logger.error("Trying to remove file that's already gone, ignoring:", dest);
+            this.emitter.emit('errorIgnored', e);
+          } else {
+            throw e;
+          }
+        }
+        this.emitter.emit('didRemove', dest, change);
+        this.logger.log("Removed", dest);
+      } else {
+        var contentsBuffer = await this.client.promise.readFile(change.path, {buffer: true});
+        await fs.promise.writeFile(dest, contentsBuffer);
+        this.emitter.emit('didWriteFile', dest, change);
+      }
+    } else {
+      var err = new Error("I'm confused; I don't know how to deal with this kind of change");
+      err.change = change;
+      this.emitter.emit('errorConfused', err);
+      throw err;
+    }
+
+    return true;
+
+  }
 }
 
-
-async function getAsync(client, cursor, destFolder, emitter, opts) {
-
-  var delta = await client.promise.delta(cursor);
-  if (!delta) {
-    return cursor;
-  }
-  var newCursor = delta.cursorTag;
-  var awaitables = [];
-  for (var change of delta.changes) {
-    emitter.emit('changeTo', change.path, change);
-    awaitables.push(processChangeAsync(client, change, destFolder, emitter, opts));
-  }
-  try {
-    await Promise.all(awaitables);
-  } catch (e) {
-    console.error("Error syncing (but will continue anyway):", e.message);
-    emitter.emit('errorIgnored', e);
-    // Wait 15 seconds
-    await delayAsync(15000);
-    // Return the old cursor since the sync failed
-    return cursor;
-  }
-
-  //console.log("Synced as of", Date.now());
-  emitter.emit('syncedToCursor', newCursor);
-  return newCursor;
-
-}
-
-async function processChangeAsync(client, change, destFolder, emitter, opts) {
-  opts = opts || {};
-  var dest = path.join(destFolder, change.path);
-  if (opts.verbose) {
-    console.log("Syncing", dest, "...");
-  }
-  if (change.wasRemoved) {
-    await fs.promise.unlink(dest);
-    emitter.emit('didRemove', dest, change);
-  } else if (change.stat.isFolder) {
-    await mkdirp.promise(dest);
-    emitter.emit('didMkdirp', dest, change);
-  } else if (change.stat.isFile) {
-    // nesh*> yield fs.promise.writeFile('/tmp/image.jpg', yield c.promise.readFile('/dellie.jpg', {buffer:true}))
-    var contentsBuffer = await client.promise.readFile(change.path, {buffer: true});
-    await fs.promise.writeFile(dest, contentsBuffer);
-    emitter.emit('didWriteFile', dest, change);
-  } else {
-    throw new Error("I'm confused and don't know how to deal with this change", change);
-  }
-}
-
-
-
-module.exports = {
-  getAsync,
-  getClient,
-  processChangeAsync,
-  secret,
-  syncLoop,
-  startSyncing,
-  c: getClient(),
+module.exports = function (...args) {
+  return new DropboxSyncer(...args);
 };
+
+_.assign(module.exports, {
+  DropboxSyncer,
+  getClient,
+  c: getClient(),
+});
